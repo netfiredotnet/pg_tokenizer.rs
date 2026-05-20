@@ -84,7 +84,8 @@ pgrx::extension_sql!(
     r#"
 CREATE TABLE tokenizer_catalog.tokenizer (
     name TEXT NOT NULL UNIQUE PRIMARY KEY,
-    config TEXT NOT NULL
+    config TEXT NOT NULL,
+    owner NAME NOT NULL DEFAULT CURRENT_USER
 );
 "#,
     name = "tokenizer_table"
@@ -118,8 +119,14 @@ fn get_tokenizer_from_database(name: &str) -> Option<TokenizerPtr> {
     Some(Arc::new(Tokenizer::build(config)))
 }
 
-#[pgrx::pg_extern(volatile, parallel_safe)]
-fn create_tokenizer(name: &str, config: &str) {
+#[pgrx::pg_extern(
+    name = "__pg_tokenizer_create_tokenizer",
+    volatile,
+    parallel_safe,
+    security_definer,
+)]
+#[pgrx::search_path(tokenizer_catalog, pg_catalog)]
+fn create_tokenizer_internal(name: &str, config: &str, owner: &str) {
     let config: TokenizerConfig = toml::from_str(config).unwrap();
     config.validate().unwrap();
 
@@ -130,11 +137,11 @@ fn create_tokenizer(name: &str, config: &str) {
         let tuptable = client
             .update(
                 r#"
-                INSERT INTO tokenizer_catalog.tokenizer (name, config) VALUES ($1, $2)
+                INSERT INTO tokenizer_catalog.tokenizer (name, config, owner) VALUES ($1, $2, $3)
                 ON CONFLICT (name) DO NOTHING RETURNING 1
                 "#,
                 Some(1),
-                &[name.into(), config_str.into()],
+                &[name.into(), config_str.into(), owner.into()],
             )
             .unwrap();
 
@@ -146,27 +153,39 @@ fn create_tokenizer(name: &str, config: &str) {
     });
 }
 
-#[pgrx::pg_extern(volatile, parallel_safe)]
-fn drop_tokenizer(name: &str) {
+#[pgrx::pg_extern(
+    name = "__pg_tokenizer_drop_tokenizer",
+    volatile,
+    parallel_safe,
+    security_definer,
+)]
+#[pgrx::search_path(tokenizer_catalog, pg_catalog)]
+fn drop_tokenizer_internal(name: &str, owner: &str) {
     pgrx::Spi::connect_mut(|client| {
         let tuptable = client
             .update(
-                "DELETE FROM tokenizer_catalog.tokenizer WHERE name = $1 RETURNING 1",
+                "DELETE FROM tokenizer_catalog.tokenizer WHERE name = $1 AND owner = $2 RETURNING 1",
                 Some(1),
-                &[name.into()],
+                &[name.into(), owner.into()],
             )
             .unwrap();
 
         if tuptable.is_empty() {
-            pgrx::warning!("Tokenizer not found: {}", name);
+            panic!("Tokenizer not found or not owned by current user: {}", name);
         }
     });
 
     TOKENIZER_OBJECT_POOL.remove(name);
 }
 
-#[pgrx::pg_extern(stable, parallel_safe)]
-pub fn tokenize(text: &str, tokenizer_name: &str) -> Vec<i32> {
+#[pgrx::pg_extern(
+    name = "__pg_tokenizer_tokenize",
+    stable,
+    parallel_safe,
+    security_definer,
+)]
+#[pgrx::search_path(tokenizer_catalog, pg_catalog)]
+pub fn tokenize_internal(text: &str, tokenizer_name: &str) -> Vec<i32> {
     let tokenizer = get_tokenizer(tokenizer_name);
     tokenizer
         .tokenize(text)
@@ -174,3 +193,39 @@ pub fn tokenize(text: &str, tokenizer_name: &str) -> Vec<i32> {
         .map(|x| x.try_into().unwrap())
         .collect()
 }
+
+pgrx::extension_sql!(
+    r#"
+CREATE FUNCTION tokenizer_catalog.create_tokenizer(name TEXT, config TEXT)
+RETURNS VOID
+LANGUAGE sql VOLATILE PARALLEL SAFE SECURITY DEFINER
+SET search_path = tokenizer_catalog, pg_catalog
+AS $$ SELECT tokenizer_catalog.__pg_tokenizer_create_tokenizer($1, $2, CASE WHEN pg_catalog.current_setting('role') = 'none' THEN session_user::text ELSE pg_catalog.current_setting('role') END); $$;
+"#,
+    name = "create_tokenizer_wrapper_sql",
+    requires = [create_tokenizer_internal]
+);
+
+pgrx::extension_sql!(
+    r#"
+CREATE FUNCTION tokenizer_catalog.drop_tokenizer(name TEXT)
+RETURNS VOID
+LANGUAGE sql VOLATILE PARALLEL SAFE SECURITY DEFINER
+SET search_path = tokenizer_catalog, pg_catalog
+AS $$ SELECT tokenizer_catalog.__pg_tokenizer_drop_tokenizer($1, CASE WHEN pg_catalog.current_setting('role') = 'none' THEN session_user::text ELSE pg_catalog.current_setting('role') END); $$;
+"#,
+    name = "drop_tokenizer_wrapper_sql",
+    requires = [drop_tokenizer_internal]
+);
+
+pgrx::extension_sql!(
+    r#"
+CREATE FUNCTION tokenizer_catalog.tokenize(text TEXT, tokenizer_name TEXT)
+RETURNS INTEGER[]
+LANGUAGE sql STABLE PARALLEL SAFE SECURITY DEFINER
+SET search_path = tokenizer_catalog, pg_catalog
+AS $$ SELECT tokenizer_catalog.__pg_tokenizer_tokenize($1, $2); $$;
+"#,
+    name = "tokenize_wrapper_sql",
+    requires = [tokenize_internal]
+);

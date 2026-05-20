@@ -56,7 +56,8 @@ pgrx::extension_sql!(
     r#"
 CREATE TABLE tokenizer_catalog.synonym (
     name TEXT NOT NULL UNIQUE PRIMARY KEY,
-    config TEXT NOT NULL
+    config TEXT NOT NULL,
+    owner NAME NOT NULL DEFAULT CURRENT_USER
 );
 "#,
     name = "synonym_table"
@@ -93,19 +94,25 @@ fn get_synonym_token_filter_from_database(name: &str) -> Option<SynonymTokenFilt
     Some(Arc::new(synonym))
 }
 
-#[pgrx::pg_extern(volatile, parallel_safe)]
-fn create_synonym(name: &str, config: &str) {
+#[pgrx::pg_extern(
+    name = "__pg_tokenizer_create_synonym",
+    volatile,
+    parallel_safe,
+    security_definer,
+)]
+#[pgrx::search_path(tokenizer_catalog, pg_catalog)]
+fn create_synonym_internal(name: &str, config: &str, owner: &str) {
     let synonym = SynonymTokenFilter::build(config);
 
     pgrx::Spi::connect_mut(|client| {
         let tuptable = client
             .update(
                 r#"
-                INSERT INTO tokenizer_catalog.synonym (name, config) VALUES ($1, $2)
+                INSERT INTO tokenizer_catalog.synonym (name, config, owner) VALUES ($1, $2, $3)
                 ON CONFLICT (name) DO NOTHING RETURNING 1
                 "#,
                 Some(1),
-                &[name.into(), config.into()],
+                &[name.into(), config.into(), owner.into()],
             )
             .unwrap();
 
@@ -122,21 +129,51 @@ fn create_synonym(name: &str, config: &str) {
     });
 }
 
-#[pgrx::pg_extern(volatile, parallel_safe)]
-fn drop_synonym(name: &str) {
+#[pgrx::pg_extern(
+    name = "__pg_tokenizer_drop_synonym",
+    volatile,
+    parallel_safe,
+    security_definer,
+)]
+#[pgrx::search_path(tokenizer_catalog, pg_catalog)]
+fn drop_synonym_internal(name: &str, owner: &str) {
     pgrx::Spi::connect_mut(|client| {
         let tuptable = client
             .update(
-                "DELETE FROM tokenizer_catalog.synonym WHERE name = $1 RETURNING 1",
+                "DELETE FROM tokenizer_catalog.synonym WHERE name = $1 AND owner = $2 RETURNING 1",
                 Some(1),
-                &[name.into()],
+                &[name.into(), owner.into()],
             )
             .unwrap();
 
         if tuptable.is_empty() {
-            pgrx::warning!("Synonym not found: {}", name);
+            panic!("Synonym not found or not owned by current user: {}", name);
         }
     });
 
     SYNONYM_OBJECT_POOL.remove(name);
 }
+
+pgrx::extension_sql!(
+    r#"
+CREATE FUNCTION tokenizer_catalog.create_synonym(name TEXT, config TEXT)
+RETURNS VOID
+LANGUAGE sql VOLATILE PARALLEL SAFE SECURITY DEFINER
+SET search_path = tokenizer_catalog, pg_catalog
+AS $$ SELECT tokenizer_catalog.__pg_tokenizer_create_synonym($1, $2, CASE WHEN pg_catalog.current_setting('role') = 'none' THEN session_user::text ELSE pg_catalog.current_setting('role') END); $$;
+"#,
+    name = "create_synonym_wrapper_sql",
+    requires = [create_synonym_internal]
+);
+
+pgrx::extension_sql!(
+    r#"
+CREATE FUNCTION tokenizer_catalog.drop_synonym(name TEXT)
+RETURNS VOID
+LANGUAGE sql VOLATILE PARALLEL SAFE SECURITY DEFINER
+SET search_path = tokenizer_catalog, pg_catalog
+AS $$ SELECT tokenizer_catalog.__pg_tokenizer_drop_synonym($1, CASE WHEN pg_catalog.current_setting('role') = 'none' THEN session_user::text ELSE pg_catalog.current_setting('role') END); $$;
+"#,
+    name = "drop_synonym_wrapper_sql",
+    requires = [drop_synonym_internal]
+);

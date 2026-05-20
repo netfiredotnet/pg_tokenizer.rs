@@ -55,10 +55,49 @@ pgrx::extension_sql!(
     r#"
 CREATE TABLE tokenizer_catalog.model (
     name TEXT NOT NULL UNIQUE PRIMARY KEY,
-    config TEXT NOT NULL
+    config TEXT NOT NULL,
+    owner NAME NOT NULL DEFAULT CURRENT_USER
 );
 "#,
     name = "model_table"
+);
+
+pgrx::extension_sql!(
+    r#"
+REVOKE ALL ON FUNCTION tokenizer_catalog.__pg_tokenizer_create_tokenizer(TEXT, TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION tokenizer_catalog.__pg_tokenizer_drop_tokenizer(TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION tokenizer_catalog.__pg_tokenizer_tokenize(TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION tokenizer_catalog.__pg_tokenizer_create_text_analyzer(TEXT, TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION tokenizer_catalog.__pg_tokenizer_drop_text_analyzer(TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION tokenizer_catalog.__pg_tokenizer_apply_text_analyzer(TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION tokenizer_catalog.__pg_tokenizer_create_stopwords(TEXT, TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION tokenizer_catalog.__pg_tokenizer_drop_stopwords(TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION tokenizer_catalog.__pg_tokenizer_create_synonym(TEXT, TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION tokenizer_catalog.__pg_tokenizer_drop_synonym(TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION tokenizer_catalog.__pg_tokenizer_create_huggingface_model(TEXT, TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION tokenizer_catalog.__pg_tokenizer_drop_huggingface_model(TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION tokenizer_catalog.__pg_tokenizer_create_lindera_model(TEXT, TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION tokenizer_catalog.__pg_tokenizer_drop_lindera_model(TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION tokenizer_catalog.__pg_tokenizer_apply_text_analyzer_for_custom_model(TEXT, TEXT) FROM PUBLIC;
+"#,
+    name = "revoke_internal_helper_execute_from_public",
+    requires = [
+        "create_tokenizer_wrapper_sql",
+        "drop_tokenizer_wrapper_sql",
+        "tokenize_wrapper_sql",
+        "create_text_analyzer_wrapper_sql",
+        "drop_text_analyzer_wrapper_sql",
+        "apply_text_analyzer_wrapper_sql",
+        "create_stopwords_wrapper_sql",
+        "drop_stopwords_wrapper_sql",
+        "create_synonym_wrapper_sql",
+        "drop_synonym_wrapper_sql",
+        "create_huggingface_model_wrapper_sql",
+        "drop_huggingface_model_wrapper_sql",
+        "create_lindera_model_wrapper_sql",
+        "drop_lindera_model_wrapper_sql",
+        "apply_text_analyzer_for_custom_model_wrapper_sql"
+    ]
 );
 
 pub fn get_model(name: &str) -> TokenizerModelPtr {

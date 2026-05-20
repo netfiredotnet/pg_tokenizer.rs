@@ -1,0 +1,83 @@
+statement ok
+BEGIN;
+
+statement ok
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_mcm_a') THEN
+        CREATE ROLE app_mcm_a LOGIN;
+    END IF;
+END
+$$;
+
+statement ok
+GRANT USAGE ON SCHEMA tokenizer_catalog TO app_mcm_a;
+
+statement ok
+GRANT CREATE ON SCHEMA public TO app_mcm_a;
+
+statement ok
+SET ROLE app_mcm_a;
+
+statement ok
+CREATE TABLE public.mcm_docs (
+    id SERIAL PRIMARY KEY,
+    passage TEXT
+);
+
+statement ok
+INSERT INTO public.mcm_docs (passage) VALUES
+('Managed postgres custom model setup row one'),
+('Managed postgres custom model setup row two');
+
+statement ok
+SELECT tokenizer_catalog.create_text_analyzer('mcm_ta1', $$
+pre_tokenizer = "unicode_segmentation"
+[[character_filters]]
+to_lowercase = {}
+$$);
+
+statement ok
+SELECT tokenizer_catalog.create_custom_model('mcm_model1', $$
+table = 'public.mcm_docs'
+column = 'passage'
+text_analyzer = 'mcm_ta1'
+$$);
+
+statement ok
+SELECT tokenizer_catalog.create_tokenizer('mcm_tok1', $$
+text_analyzer = 'mcm_ta1'
+model = 'mcm_model1'
+$$);
+
+statement ok
+SAVEPOINT custom_internal_call_denied;
+
+statement error
+SELECT tokenizer_catalog.__pg_tokenizer_drop_custom_model_catalog('not-the-internal-token', 'mcm_model1', 'app_mcm_a');
+
+statement ok
+ROLLBACK TO SAVEPOINT custom_internal_call_denied;
+
+query I
+SELECT CASE WHEN cardinality(tokenizer_catalog.tokenize('managed postgres custom model', 'mcm_tok1')) > 0 THEN 1 ELSE 0 END;
+----
+1
+
+statement ok
+INSERT INTO public.mcm_docs (passage) VALUES ('Managed postgres custom model trigger row');
+
+statement ok
+SELECT tokenizer_catalog.drop_tokenizer('mcm_tok1');
+
+statement ok
+SELECT tokenizer_catalog.drop_custom_model('mcm_model1');
+
+statement ok
+SELECT tokenizer_catalog.drop_text_analyzer('mcm_ta1');
+
+statement ok
+RESET ROLE;
+
+statement ok
+ROLLBACK;

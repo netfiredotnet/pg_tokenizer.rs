@@ -1,0 +1,81 @@
+statement ok
+BEGIN;
+
+statement ok
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_cnpg_a') THEN
+        CREATE ROLE app_cnpg_a LOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_cnpg_b') THEN
+        CREATE ROLE app_cnpg_b LOGIN;
+    END IF;
+END
+$$;
+
+statement ok
+GRANT USAGE ON SCHEMA tokenizer_catalog TO app_cnpg_a, app_cnpg_b;
+
+statement ok
+SET ROLE app_cnpg_a;
+
+statement ok
+SELECT tokenizer_catalog.create_tokenizer('cnpg_tok_shared', $$
+model = "llmlingua2"
+$$);
+
+query I
+SELECT cardinality(tokenizer_catalog.tokenize('hello cloud native postgres', 'cnpg_tok_shared'));
+----
+7
+
+statement ok
+RESET ROLE;
+
+statement ok
+SET ROLE app_cnpg_b;
+
+statement ok
+SAVEPOINT internal_call_denied;
+
+statement error
+SELECT tokenizer_catalog.__pg_tokenizer_drop_tokenizer('cnpg_tok_shared', 'app_cnpg_a');
+
+statement ok
+ROLLBACK TO SAVEPOINT internal_call_denied;
+
+statement ok
+SAVEPOINT direct_dml_denied;
+
+statement error
+INSERT INTO tokenizer_catalog.tokenizer(name, config, owner)
+VALUES ('cnpg_tok_direct', $$model = "llmlingua2"$$, 'app_cnpg_a');
+
+statement ok
+ROLLBACK TO SAVEPOINT direct_dml_denied;
+
+query I
+SELECT cardinality(tokenizer_catalog.tokenize('hello cloud native postgres', 'cnpg_tok_shared'));
+----
+7
+
+statement ok
+SAVEPOINT drop_denied;
+
+statement error
+SELECT tokenizer_catalog.drop_tokenizer('cnpg_tok_shared');
+
+statement ok
+ROLLBACK TO SAVEPOINT drop_denied;
+
+statement ok
+RESET ROLE;
+
+statement ok
+SET ROLE app_cnpg_a;
+
+statement ok
+SELECT tokenizer_catalog.drop_tokenizer('cnpg_tok_shared');
+
+statement ok
+RESET ROLE;

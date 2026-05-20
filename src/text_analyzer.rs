@@ -81,7 +81,8 @@ pgrx::extension_sql!(
     r#"
 CREATE TABLE tokenizer_catalog.text_analyzer (
     name TEXT NOT NULL UNIQUE PRIMARY KEY,
-    config TEXT NOT NULL
+    config TEXT NOT NULL,
+    owner NAME NOT NULL DEFAULT CURRENT_USER
 );
 "#,
     name = "text_analyzer_table"
@@ -119,8 +120,14 @@ fn get_text_analyzer_from_database(name: &str) -> Option<TextAnalyzerPtr> {
     Some(Arc::new(TextAnalyzer::build(config)))
 }
 
-#[pgrx::pg_extern(volatile, parallel_safe)]
-fn create_text_analyzer(name: &str, config: &str) {
+#[pgrx::pg_extern(
+    name = "__pg_tokenizer_create_text_analyzer",
+    volatile,
+    parallel_safe,
+    security_definer,
+)]
+#[pgrx::search_path(tokenizer_catalog, pg_catalog)]
+fn create_text_analyzer_internal(name: &str, config: &str, owner: &str) {
     let config: TextAnalyzerConfig = toml::from_str(config).unwrap();
     config.validate().unwrap();
 
@@ -131,11 +138,11 @@ fn create_text_analyzer(name: &str, config: &str) {
         let tuptable = client
             .update(
                 r#"
-                INSERT INTO tokenizer_catalog.text_analyzer (name, config) VALUES ($1, $2)
+                INSERT INTO tokenizer_catalog.text_analyzer (name, config, owner) VALUES ($1, $2, $3)
                 ON CONFLICT (name) DO NOTHING RETURNING 1
                 "#,
                 Some(1),
-                &[name.into(), config_str.into()],
+                &[name.into(), config_str.into(), owner.into()],
             )
             .unwrap();
 
@@ -147,27 +154,75 @@ fn create_text_analyzer(name: &str, config: &str) {
     });
 }
 
-#[pgrx::pg_extern(volatile, parallel_safe)]
-fn drop_text_analyzer(name: &str) {
+#[pgrx::pg_extern(
+    name = "__pg_tokenizer_drop_text_analyzer",
+    volatile,
+    parallel_safe,
+    security_definer,
+)]
+#[pgrx::search_path(tokenizer_catalog, pg_catalog)]
+fn drop_text_analyzer_internal(name: &str, owner: &str) {
     pgrx::Spi::connect_mut(|client| {
         let tuptable = client
             .update(
-                "DELETE FROM tokenizer_catalog.text_analyzer WHERE name = $1 RETURNING 1",
+                "DELETE FROM tokenizer_catalog.text_analyzer WHERE name = $1 AND owner = $2 RETURNING 1",
                 Some(1),
-                &[name.into()],
+                &[name.into(), owner.into()],
             )
             .unwrap();
 
         if tuptable.is_empty() {
-            pgrx::warning!("TextAnalyzer not found: {}", name);
+            panic!("TextAnalyzer not found or not owned by current user: {}", name);
         }
     });
 
     TEXT_ANALYZER_OBJECT_POOL.remove(name);
 }
 
-#[pgrx::pg_extern(immutable, parallel_safe)]
-fn apply_text_analyzer(text: &str, text_analyzer_name: &str) -> Vec<String> {
+#[pgrx::pg_extern(
+    name = "__pg_tokenizer_apply_text_analyzer",
+    immutable,
+    parallel_safe,
+    security_definer,
+)]
+#[pgrx::search_path(tokenizer_catalog, pg_catalog)]
+fn apply_text_analyzer_internal(text: &str, text_analyzer_name: &str) -> Vec<String> {
     let text_analyzer = get_text_analyzer(text_analyzer_name);
     text_analyzer.apply(text)
 }
+
+pgrx::extension_sql!(
+    r#"
+CREATE FUNCTION tokenizer_catalog.create_text_analyzer(name TEXT, config TEXT)
+RETURNS VOID
+LANGUAGE sql VOLATILE PARALLEL SAFE SECURITY DEFINER
+SET search_path = tokenizer_catalog, pg_catalog
+AS $$ SELECT tokenizer_catalog.__pg_tokenizer_create_text_analyzer($1, $2, CASE WHEN pg_catalog.current_setting('role') = 'none' THEN session_user::text ELSE pg_catalog.current_setting('role') END); $$;
+"#,
+    name = "create_text_analyzer_wrapper_sql",
+    requires = [create_text_analyzer_internal]
+);
+
+pgrx::extension_sql!(
+    r#"
+CREATE FUNCTION tokenizer_catalog.drop_text_analyzer(name TEXT)
+RETURNS VOID
+LANGUAGE sql VOLATILE PARALLEL SAFE SECURITY DEFINER
+SET search_path = tokenizer_catalog, pg_catalog
+AS $$ SELECT tokenizer_catalog.__pg_tokenizer_drop_text_analyzer($1, CASE WHEN pg_catalog.current_setting('role') = 'none' THEN session_user::text ELSE pg_catalog.current_setting('role') END); $$;
+"#,
+    name = "drop_text_analyzer_wrapper_sql",
+    requires = [drop_text_analyzer_internal]
+);
+
+pgrx::extension_sql!(
+    r#"
+CREATE FUNCTION tokenizer_catalog.apply_text_analyzer(text TEXT, text_analyzer_name TEXT)
+RETURNS TEXT[]
+LANGUAGE sql IMMUTABLE PARALLEL SAFE SECURITY DEFINER
+SET search_path = tokenizer_catalog, pg_catalog
+AS $$ SELECT tokenizer_catalog.__pg_tokenizer_apply_text_analyzer($1, $2); $$;
+"#,
+    name = "apply_text_analyzer_wrapper_sql",
+    requires = [apply_text_analyzer_internal]
+);
